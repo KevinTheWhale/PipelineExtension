@@ -1,94 +1,116 @@
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago # for compact datetime
-from datetime import datetime
-import pandas as pd
-import numpy as np
+from __future__ import annotations
+import logging
+from datetime import timedelta
 from pathlib import Path
+import pendulum
+import pandas as pd
 
-def queue_data(ds=None,**kwargs): # Extract
-    if(ds is None):
-        ds = datetime.today().strftime('%Y-%m-%d')
-        print(ds)
-    print("Loading SOTE data from CSV...")
-    # Batch Processing
-    print(f"Execution date {ds}")
-    file_path = f"/Users/Kevin/Documents/Developer/SOTE/SOTE/SOTE_BATCH/{ds}.csv" # Airflow gives this automatically (e.g., '2025-04-14')
-    sote_df = pd.read_csv(file_path)
-    print(sote_df.shape)
-    print(sote_df.head())
-    return sote_df # return the newly queued df
+from airflow import DAG
+from airflow.decorators import dag, task
+from airflow.models import Variable
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 
-def clean_data(sote_df): # Transform
-    print("Cleaning and preprocessing...")
-    # Check for duplicates
-    
-    # Check by year:
-    sote_yearOne = sote_df[sote_df[['Semester'].isin([2144,2152])]]
-    sote_yearTwo = sote_df[sote_df[['Semester'].isin([2164,2172])]]
+# Config (Variables -> Admin > Variables)
+BASE_DIR = Path(Variable.get("sote_base_path", default_var="/opt/airflow/data/sote"))
+RAW_DIR = BASE_DIR / "raw"
+STAGE_DIR = BASE_DIR / "stage"
 
-    clean_yearOne = sote_yearOne.drop_duplicates()
-    clean_yearTwo = sote_yearTwo.drop_duplicates()
-
-    # combine into one df
-    sote_clean = pd.concat([clean_yearOne,clean_yearTwo],ignore_index=True)
-
-    # Drop unwanted columns: 
-    drop_cols = [sote_df[i] for i in [3,7,8,10,15]]
-    sote_clean = sote_clean.drop(columns=drop_cols)
-
-    # Filter out Q16 and Q17:
-    sote_clean = sote_clean[sote_clean['Question.16'] != '2']
-    sote_clean = sote_clean[sote_clean['Question.17'] != '2']
-
-    sote_clean = sote_clean.drop(columns=['Question.16','Question.17'])
-
-    # Handle missing values:
-    na_count = sote_clean.isna().sum()
-    sote_clean = sote_clean.drop(columns=[sote_clean.columns[8]]) # record number
-    sote_clean = sote_clean.dropna()
-
-    ######################################################################################################
-
-    # Recode semester: (For organization)
-    sote_clean['Semester'] = sote_clean['Semester'].astype('category')
-    semester_map = {
-        2144: 'Fall 14', 2152: 'Spring 15',
-        2164: 'Fall 16', 2172: 'Spring 17'
-    }
-    sote_clean['Semester'] = sote_clean['Semester'].replace(semester_map)
-
-    # Recode 
-
-
-
-def train_model():
-    print("Training logistic regression model...")
-
-def save_results(): # Load
-    print("Saving metrics to log...")
-
-default_args = {
-    'start_date': datetime(2024, 1, 1),
-    'retries': 1
+DEFAULT_ARGS = {
+    "owner": "kevin",
+    "depends_on_past": False,
+    "retries": 2,
+    "retry_delay": timedelta(minutes=5),
 }
-queue_data()
 
+@dag(
+    dag_id="sote_etl_pipeline",
+    description="Ingest SOTE CSV, clean it, and load to Postgres for analysis",
+    default_args=DEFAULT_ARGS,
+    start_date=pendulum.datetime(2025, 8, 1, tz="America/Los_Angeles"),
+    schedule="0 3 * * *",  # every day at 03:00
+    catchup=False,
+    max_active_runs=1,
+    tags=["sote", "etl", "pandas"],
+)
+def sote_etl():
+    @task
+    def queue_data(ds: str) -> str:
+        """
+        Locate the raw CSV for the partition date and copy to a staging path.
+        Returns the staged file path (string).
+        """
+        raw_path = RAW_DIR / f"SOTE_{ds}.csv"  # e.g., /opt/airflow/data/sote/raw/SOTE_2025-08-15.csv
+        if not raw_path.exists():
+            raise FileNotFoundError(f"Expected raw file not found: {raw_path}")
 
-with DAG(
-    dag_id='sote_model_pipeline',
-    schedule_interval='@daily',
-    default_args=default_args,
-    catchup=False
-) as dag:
+        staged_path = STAGE_DIR / f"staged_{ds}.csv"
+        staged_path.parent.mkdir(parents=True, exist_ok=True)
+        staged_path.write_bytes(raw_path.read_bytes())
+        logging.info("Staged raw CSV: %s", staged_path)
+        return str(staged_path)
 
-    task1 = PythonOperator(
-    task_id='queue_data',
-    python_callable=queue_data,
-    op_kwargs={'ds': '{{ ds }}'},)  # pass execution date string
-    task2 = PythonOperator(task_id='clean_data', python_callable=clean_data)
-    task3 = PythonOperator(task_id='train_model', python_callable=train_model)
-    task4 = PythonOperator(task_id='save_results', python_callable=save_results)
+    @task
+    def clean_data(staged_csv_path: str) -> str:
+        """
+        Read staged CSV, apply cleaning rules, write clean Parquet.
+        Returns the clean parquet path (string).
+        """
+        df = pd.read_csv(staged_csv_path)
 
-    task1 >> task2 >> task3 >> task4  # Set execution order
+        # === EXAMPLES of cleaning steps (customize to your SOTE schema) ===
+        # Strip whitespace from column names
+        df.columns = [c.strip() for c in df.columns]
 
+        # Drop fully empty columns
+        df = df.dropna(axis=1, how="all")
+
+        # Example: standardize grade labels
+        if "Official Grade" in df.columns:
+            df["Official Grade"] = df["Official Grade"].astype(str).str.upper().str.strip()
+
+        # Example: date parsing
+        for col in ("SurveyDate", "Term"):
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+
+        # Write out a partitioned artifact
+        clean_path = Path(staged_csv_path).with_suffix(".parquet").as_posix().replace("staged_", "clean_")
+        pd.DataFrame(df).to_parquet(clean_path, index=False)
+        logging.info("Wrote cleaned parquet: %s", clean_path)
+        return clean_path
+
+    @task
+    def load_to_db(clean_parquet_path: str, table_name: str = "sote_clean") -> str:
+        """
+        Load cleaned data to Postgres using a connection (airflow conn id: 'analytics_pg').
+        Idempotent: overwrites the ds partition if such column exists; else truncates+load (simple demo).
+        """
+        hook = PostgresHook(postgres_conn_id="analytics_pg")
+
+        df = pd.read_parquet(clean_parquet_path)
+
+        # OPTIONAL: add a partition column based on file name
+        # (assumes path like clean_YYYY-MM-DD.parquet)
+        p = Path(clean_parquet_path)
+        ds_part = p.stem.replace("clean_", "")
+        if "ds" not in df.columns:
+            df["ds"] = ds_part
+
+        # Create table if needed (very simple schema inference)
+        # For production, define DDL explicitly and enforce types.
+        engine = hook.get_sqlalchemy_engine()
+        with engine.begin() as conn:
+            # Idempotent load strategy:
+            # 1) delete existing partition
+            conn.execute(f'DELETE FROM {table_name} WHERE ds = %(ds)s', {"ds": ds_part})
+            # 2) append fresh data
+            df.to_sql(table_name, con=conn, if_exists="append", index=False)
+
+        logging.info("Loaded %d rows into %s for ds=%s", len(df), table_name, ds_part)
+        return f"{table_name}:{ds_part}"
+
+    staged = queue_data()  # ds auto-injected by TaskFlow
+    cleaned = clean_data(staged)
+    _loaded = load_to_db(cleaned)
+
+dag = sote_etl()
